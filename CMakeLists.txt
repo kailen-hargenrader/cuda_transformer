@@ -78,3 +78,6 @@ add_test(NAME silumulttest COMMAND silumulttest)
 add_executable(gqatest ./src/tests/GQATest.cu)
 target_link_libraries(gqatest PRIVATE transformer_lib)
 add_test(NAME gqatest COMMAND gqatest)
+
+add_executable(part1bench ./src/tests/Part1Benchmark.cu)
+target_link_libraries(part1bench PRIVATE transformer_lib)

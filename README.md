@@ -52,10 +52,18 @@ Instead, we will implement matrix-vector multiply with standard fused-multiply-a
 What is ratio of BF16 tensor core FLOPS to BF16 non-tensor core FLOPS on an A100-PCIE-40GB GPU?
 Note: NVIDIA and AMD marketing both try to inflate their performance by measuring "sparse" tensor core operations, but nobody uses those.
 
+
+The A100 has 312 TFLOPS when using tensor cores and 39 TFLOPS when using CUDA cores. Thus the ratio is 8:1.
+
+
 ### Question 1.2 (5 points)
 What is the expected speedup of tensor cores vs non-tensor cores for matrix-vector multiplication on an A100-PCIE-40GB GPU?
 Make an argument based on arithmetic intensity (FLOPS is not the whole story).
 Assume the matrix and vector are read from off-chip memory.
+
+
+For matrix vector multiplication the arithmetic intensity is 1 FLOP/Byte. This is because I only need to multiply each matrix element by one element in the vector. The full utilization of the cuda cores comes when the memory load speed per single byte matches the speed at which all operations can be done on that byte. For the A100, this requires about 50 FLOPs/Byte. Thus, GEMV is extremely memory bound and therefore there is pretty much no speedup for using tensor cores.
+
 
 ### Coding (80 points)
 Implement GPU operators:
@@ -74,6 +82,23 @@ For example:
 - Explain which kernels are the most important to optimize, and which ones are less important.
 - Explain how the performance would be different in another scenario (e.g. longer sequence length, larger model, increased batch size)
 - Explain similarities across the kernels
+
+
+
+ALL SCREENSHOTS IN profiling/profile_screenshots!!!
+
+Argmax: This kernel is pretty lightweight compared to the matvec multiply, so it is not very important to optimize. On SOL it is hard to see if our kernel is optimal because we do not fill the grid (we will do this in parallel over the sequence dimension later). However, we can see that the kernel is memory bound by looking at the long scoreboard stalls. Each warp sits idle for 16.6 cycles on average waiting for memory from the L1 cache.
+
+LayerNorm: This kernel is also lightweight compared to the matvec multiply. It is similar to the Argmax kernel in that it is memory bound. Each warp sits idle for 15.4 cycles on average waiting for cache misses. One inefficient part of layernorm is that naively it is two pass. If I were to optimize it futher I would do an online layernorm (one pass) called Welford's Algorithm.
+
+MatVec Multiply: This kernel is highly efficient. It shows high memory and compute throughput. The bottleneck is the VRAM store speed. This is not really a problem that can be fixed. However, we could optimize further by loading 2 bf16 from VRAM at a time instead of 1.
+
+RoPE: This kernel takes 4us which is extremely small compared to the Matvec multiply. Thus, it is not worth trying to optimize. Even still, there are no obvious optimizations besides increasing the gridsize when there is a larger task. One thing that is nice about this operation is that it is completely parallelizable, so it will not become a problem with scale. One thing that could be improved regardless is that we load real and imaginary parts 
+separately instead of as a float2. Also, if we could just recompute these values if that's faster.
+
+Silu: This kernel, similar to RoPE is lightweight compared to Matvec multiply and is completely parallel. Thus, it is not worth trying to hyperoptimize.
+
+
 
 ## Part 2 (second week)
 

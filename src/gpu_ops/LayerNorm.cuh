@@ -8,6 +8,10 @@
  * Internally, uses float32 for all calculations, and only rounds back to bfloat16 at the end.
  */
 class LayerNorm {
+    /// Scratch for partial sums followed by one float holding the inverse RMS.
+    std::shared_ptr<CudaBuffer> temp_space;
+    int32_t partial_count;
+
 public:
     /// epsilon to add in denominator square root, for numerical stability
     static constexpr float EPS = 1.0e-6f;
