@@ -108,17 +108,104 @@ To submit, zip your repository to `~/lab6_2025_submission.zip`.
 List all the matrix-vector multiplies in a Qwen2 0.5B layer, including the (M, K) dimensions of the matrix.
 (Do not include grouped-query attention).
 
+**Answer:**
+
+A Qwen2 0.5B layer includes the following matrix-vector multiplies (excluding grouped-query attention):
+
+1. **Q, K, V projections**
+   - `q_proj`: `(896, 896)`
+   - `k_proj`: `(128, 896)`
+   - `v_proj`: `(128, 896)`
+2. **Output projection**
+   - `o_proj`: `(896, 896)`
+3. **MLP projections**
+   - `gate_proj`: `(4864, 896)`
+   - `up_proj`: `(4864, 896)`
+   - `down_proj`: `(896, 4864)`
+
+These come from the `Qwen2Config` values:
+- `hidden_size = 896`
+- `num_query_heads = 14`
+- `num_kv_heads = 2`
+- `head_size = 64`
+- `intermediate_size = 4864`
+
+So the projection output sizes are:
+- `queries_size = 14 * 64 = 896`
+- `keys_size = 2 * 64 = 128`
+- `values_size = 2 * 64 = 128`
+
 ### Question 2.2 (2 points)
 Treating each query head as a row of a matrix, what are the dimensions of the matrix-matrix multiply in a
 Qwen2 0.5B layer grouped-query attention operation? Assume current sequence length is 1234 tokens.
+
+**Answer:**
+
+For Qwen2 0.5B, each query head has size `64`, and there are `14` query heads total.
+
+Treating each query head as a row, the attention-score matmul is:
+
+- Queries: `(14, 64)`
+- Keys across the context: `(64, 1234)`
+- Result: `(14, 1234)`
+
+Because this is grouped-query attention, the `2` KV heads are shared across the `14` query heads, but the score matrix still has one row per query head.
 
 ### Question 2.3 (5 points)
 Assuming off-chip memory bandwidth is the limiting factor, what is the theoretical minimum inference latency (in ms)
 for Qwen2 0.5B on an A100-PCIE-40GB, with BF16 weights? Assume small sequence length (i.e. KV cache size is negligible).
 
+**Answer:**
+
+Using the actual Qwen2 0.5B config, the model has:
+
+- Token embedding: `151936 * 896 = 136,134,656` parameters
+- Each layer: `14,912,384` parameters
+- Number of layers: `24`
+- Final layernorm: `896` parameters
+
+Total parameter count:
+
+- `136,134,656 + 24 * 14,912,384 + 896 = 494,032,768`
+
+BF16 uses 2 bytes per parameter, so total weight size is:
+
+- `494,032,768 * 2 = 988,065,536` bytes ≈ `0.988 GB`
+
+A100-PCIE-40GB memory bandwidth: ~1550 GB/s
+
+Theoretical minimum time to read all weights = (model size) / (bandwidth)
+
+= 0.988 GB / 1550 GB/s ≈ 0.000637 s ≈ 0.637 ms
+
+So, the theoretical minimum inference latency is approximately **0.64 ms**.
+
 ### Question 2.4 (5 points)
 Determine the sequence length at which the KV cache becomes non-negligible in terms of performance;
 specifically, at what sequence length in Qwen2 0.5B would the KV cache become 10% the size of the model parameters?
+
+**Answer:**
+
+Model parameter size from above is `988,065,536` bytes, so 10% is:
+
+- `98,806,553.6` bytes
+
+Each token in the KV cache stores a key and value for every layer:
+
+- `num_layers = 24`
+- `num_kv_heads = 2`
+- `head_size = 64`
+- BF16 = `2` bytes per value
+
+Bytes per token:
+
+- `24 * 2 * 64 * 2 * 2 = 12,288` bytes
+
+Sequence length where total KV cache is 10% of model weights:
+
+- `98,806,553.6 / 12,288 ≈ 8,041`
+
+So the KV cache becomes about 10% of the model size at roughly **8,000 tokens**.
 
 ### Coding (75 points)
 Complete:
