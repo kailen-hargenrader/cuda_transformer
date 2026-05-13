@@ -230,8 +230,24 @@ ncu --set full --nvtx --nvtx-include last_token/ -c100 -o profile ./transformer
 (may adjust -c parameter to number of kernels per layer)
 
 How many microseconds per layer does your implementation take?
+
+The current implementation takes around 400us per layer when the grid is full.
+
 What is the slowest part of the layer and why?
+
+The slowest part of the layer is specifically the merge step of attention softmax.
+This step combines the results of the tiles that use local maximums. The kernel 
+takes ~255us when the grid is full.
 Include screenshots of the something interesting you notice, and explain.
+
+In the screenshot provided (part2screenshot.png in the profile_screenshots folder),
+I can see that compute and memory throughput are balanced around 50% for the 
+fused attention and softmax kernel. Additionally, L1 cache is 50%, L2 cache is 23%,
+and DRAM is 11%. It is unclear what the bottleneck of this kernel is. I increased
+the sequence length to fill the grid. NCU does not report a small grid. Instead,
+it reports possible memory latency. This latency could be caused primarily from
+the one pass load of keys, queries, and values from global memory. To reduce this 
+latency, I would probably need double buffering. 
 
 ## Assignment notes
 

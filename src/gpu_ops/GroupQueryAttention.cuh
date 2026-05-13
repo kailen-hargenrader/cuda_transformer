@@ -10,12 +10,31 @@
 
 namespace {
 
-constexpr int kGqaTileLen = 64;
-constexpr int kGqaTileThreads = 64;
-constexpr int kGqaMergeThreads = 64;
+constexpr int kGqaWarpSize = 32;
+constexpr int kGqaWarpsPerBlock = 4;
+constexpr int kGqaRowsPerWarp = 8;
+constexpr int kGqaTileLen = kGqaWarpsPerBlock * kGqaRowsPerWarp;
+constexpr int kGqaTileThreads = kGqaWarpSize * kGqaWarpsPerBlock;
+constexpr int kGqaMergeThreads = 32;
+
+__device__ __forceinline__ float gqa_warp_sum(float value) {
+    for (int offset = kGqaWarpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float gqa_bf162_dot(__nv_bfloat162 a, __nv_bfloat162 b) {
+    return __bfloat162float(__low2bfloat16(a)) * __bfloat162float(__low2bfloat16(b)) +
+           __bfloat162float(__high2bfloat16(a)) * __bfloat162float(__high2bfloat16(b));
+}
 
 __host__ __device__ constexpr int32_t gqa_tile_count_for_seq_len(int32_t seq_len) {
     return (seq_len + kGqaTileLen - 1) / kGqaTileLen;
+}
+
+__host__ __device__ constexpr int32_t gqa_partial_count_for_seq_len(int32_t seq_len) {
+    return gqa_tile_count_for_seq_len(seq_len) * kGqaWarpsPerBlock;
 }
 
 __device__ __forceinline__ size_t gqa_partial_idx(int32_t query_head, int32_t tile_idx, int32_t max_tile_count) {
@@ -62,11 +81,13 @@ __global__ void gqa_fused_tile_kernel(const __nv_bfloat16 *__restrict__ queries,
                                       const __nv_bfloat16 *__restrict__ v_cache,
                                       float *__restrict__ partial_maxima,
                                       float *__restrict__ partial_denominators,
-                                      float *__restrict__ partial_weighted_values,
+                                      float2 *__restrict__ partial_weighted_values,
                                       int32_t layer_num,
                                       int32_t seq_len,
-                                      int32_t max_tile_count) {
+                                      int32_t max_partial_count) {
     using Config = Qwen2Config<QWEN2_SIZE>;
+    static_assert(Config::head_size() == 64, "warp-per-row GQA kernel expects head_size == 64");
+    static_assert(Config::value_size() == 64, "warp-per-row GQA kernel expects value_size == 64");
 
     const int32_t query_head = static_cast<int32_t>(blockIdx.x);
     const int32_t tile_idx = static_cast<int32_t>(blockIdx.y);
@@ -76,83 +97,100 @@ __global__ void gqa_fused_tile_kernel(const __nv_bfloat16 *__restrict__ queries,
         return;
     }
 
-    __shared__ float query_shared[Config::head_size()];
-    __shared__ float scores_shared[kGqaTileLen];
-    __shared__ float tile_max;
-    __shared__ float tile_denom;
+    constexpr int32_t kHeadPairs = Config::head_size() / 2;
+    __shared__ __nv_bfloat162 query_shared[kHeadPairs];
 
-    query_shared[tid] = __bfloat162float(queries[static_cast<size_t>(query_head) * Config::head_size() + tid]);
+    if (tid < kHeadPairs) {
+        const auto *query_pairs = reinterpret_cast<const __nv_bfloat162 *>(
+            queries + static_cast<size_t>(query_head) * Config::head_size());
+        query_shared[tid] = query_pairs[tid];
+    }
     __syncthreads();
 
     const int32_t seq_start = tile_idx * kGqaTileLen;
     const int32_t tile_len = min(kGqaTileLen, seq_len - seq_start);
     const int32_t kv_head = query_head * Config::num_kv_heads() / Config::num_query_heads();
+    const int32_t lane = tid & (kGqaWarpSize - 1);
+    const int32_t warp_id = tid / kGqaWarpSize;
 
-    if (tid < tile_len) {
-        const auto *key = gqa_key_ptr<QWEN2_SIZE>(k_cache, seq_start + tid, layer_num, kv_head);
-        float dot = 0.0f;
-        for (int32_t i = 0; i < Config::head_size(); ++i) {
-            dot += query_shared[i] * __bfloat162float(key[i]);
-        }
-        scores_shared[tid] = dot * rsqrtf(static_cast<float>(Config::head_size()));
-    }
-    __syncthreads();
+    float local_m = -INFINITY;
+    float local_l = 0.0f;
+    float2 partial_out = {0.0f, 0.0f};
+    const float scale = rsqrtf(static_cast<float>(Config::head_size()));
 
-    const size_t partial_idx = gqa_partial_idx(query_head, tile_idx, max_tile_count);
-    if (tid == 0) {
-        float local_m = -INFINITY;
-        float local_l = 0.0f;
-        for (int32_t i = 0; i < tile_len; ++i) {
-            const float score = scores_shared[i];
-            const float next_m = fmaxf(local_m, score);
-            local_l = local_l * expf(local_m - next_m) + expf(score - next_m);
-            local_m = next_m;
-        }
-        tile_max = local_m;
-        tile_denom = local_l;
-        partial_maxima[partial_idx] = local_m;
-        partial_denominators[partial_idx] = local_l;
-    }
-    __syncthreads();
+    for (int32_t row_offset = warp_id; row_offset < tile_len; row_offset += kGqaWarpsPerBlock) {
+        const int32_t seq_pos = seq_start + row_offset;
 
-    float partial_out = 0.0f;
-    for (int32_t i = 0; i < tile_len; ++i) {
-        const auto *value = gqa_value_ptr<QWEN2_SIZE>(v_cache, seq_start + i, layer_num, kv_head);
-        partial_out += expf(scores_shared[i] - tile_max) * __bfloat162float(value[tid]);
+        float dot_partial = 0.0f;
+        const auto *key_pairs = reinterpret_cast<const __nv_bfloat162 *>(
+            gqa_key_ptr<QWEN2_SIZE>(k_cache, seq_pos, layer_num, kv_head));
+        dot_partial = gqa_bf162_dot(query_shared[lane], key_pairs[lane]);
+        dot_partial = gqa_warp_sum(dot_partial);
+
+        float score = lane == 0 ? dot_partial * scale : 0.0f;
+        score = __shfl_sync(0xffffffffu, score, 0);
+
+        const float next_m = fmaxf(local_m, score);
+        const float old_scale = local_l == 0.0f ? 0.0f : expf(local_m - next_m);
+        const float new_scale = expf(score - next_m);
+
+        const auto *value_pairs = reinterpret_cast<const __nv_bfloat162 *>(
+            gqa_value_ptr<QWEN2_SIZE>(v_cache, seq_pos, layer_num, kv_head));
+        const __nv_bfloat162 value_pair = value_pairs[lane];
+        partial_out.x = partial_out.x * old_scale + new_scale * __bfloat162float(__low2bfloat16(value_pair));
+        partial_out.y = partial_out.y * old_scale + new_scale * __bfloat162float(__high2bfloat16(value_pair));
+        local_l = local_l * old_scale + new_scale;
+        local_m = next_m;
     }
-    partial_weighted_values[partial_idx * Config::value_size() + tid] = partial_out;
+
+    const size_t partial_idx = gqa_partial_idx(
+        query_head,
+        tile_idx * kGqaWarpsPerBlock + warp_id,
+        max_partial_count);
+    if (lane == 0) {
+        const bool warp_active = warp_id < tile_len;
+        partial_maxima[partial_idx] = warp_active ? local_m : 0.0f;
+        partial_denominators[partial_idx] = warp_active ? local_l : 0.0f;
+    }
+    partial_weighted_values[partial_idx * kHeadPairs + lane] =
+        warp_id < tile_len ? partial_out : float2{0.0f, 0.0f};
 }
 
 template<Qwen2Size QWEN2_SIZE>
 __global__ void gqa_merge_tile_partials_kernel(const float *__restrict__ partial_maxima,
                                                const float *__restrict__ partial_denominators,
-                                               const float *__restrict__ partial_weighted_values,
+                                               const float2 *__restrict__ partial_weighted_values,
                                                float *__restrict__ weighted_values,
                                                int32_t seq_len,
-                                               int32_t max_tile_count) {
+                                               int32_t max_partial_count) {
     using Config = Qwen2Config<QWEN2_SIZE>;
+    static_assert(Config::value_size() == 64, "warp-per-row GQA merge kernel expects value_size == 64");
+    constexpr int32_t kHeadPairs = Config::value_size() / 2;
 
     const int32_t query_head = static_cast<int32_t>(blockIdx.x);
-    const int32_t value_idx = static_cast<int32_t>(threadIdx.x);
-    if (query_head >= Config::num_query_heads() || value_idx >= Config::value_size()) {
+    const int32_t pair_idx = static_cast<int32_t>(threadIdx.x);
+    if (query_head >= Config::num_query_heads() || pair_idx >= kHeadPairs) {
         return;
     }
 
-    const int32_t tile_count = gqa_tile_count_for_seq_len(seq_len);
-    const size_t head_base = static_cast<size_t>(query_head) * static_cast<size_t>(max_tile_count);
+    const int32_t partial_count = gqa_partial_count_for_seq_len(seq_len);
+    const size_t head_base = static_cast<size_t>(query_head) * static_cast<size_t>(max_partial_count);
+    const int32_t lane = pair_idx & (kGqaWarpSize - 1);
 
     float merged_m = -INFINITY;
     float merged_l = 0.0f;
-    float merged_out = 0.0f;
-    for (int32_t tile_idx = 0; tile_idx < tile_count; ++tile_idx) {
-        const size_t partial_idx = head_base + static_cast<size_t>(tile_idx);
-        const float tile_m = partial_maxima[partial_idx];
-        const float tile_l = partial_denominators[partial_idx];
+    float2 merged_out{0.0f, 0.0f};
+    for (int32_t partial_slot = 0; partial_slot < partial_count; ++partial_slot) {
+        const size_t partial_idx = head_base + static_cast<size_t>(partial_slot);
+        float tile_m = lane == 0 ? partial_maxima[partial_idx] : 0.0f;
+        float tile_l = lane == 0 ? partial_denominators[partial_idx] : 0.0f;
+        tile_m = __shfl_sync(0xffffffffu, tile_m, 0);
+        tile_l = __shfl_sync(0xffffffffu, tile_l, 0);
         if (tile_l == 0.0f) {
             continue;
         }
 
-        const float tile_out = partial_weighted_values[partial_idx * Config::value_size() + value_idx];
+        const float2 tile_out = partial_weighted_values[partial_idx * kHeadPairs + pair_idx];
         if (merged_l == 0.0f) {
             merged_m = tile_m;
             merged_l = tile_l;
@@ -163,13 +201,20 @@ __global__ void gqa_merge_tile_partials_kernel(const float *__restrict__ partial
         const float next_m = fmaxf(merged_m, tile_m);
         const float merged_scale = expf(merged_m - next_m);
         const float tile_scale = expf(tile_m - next_m);
-        merged_out = merged_out * merged_scale + tile_out * tile_scale;
+        merged_out.x = merged_out.x * merged_scale + tile_out.x * tile_scale;
+        merged_out.y = merged_out.y * merged_scale + tile_out.y * tile_scale;
         merged_l = merged_l * merged_scale + tile_l * tile_scale;
         merged_m = next_m;
     }
 
-    weighted_values[static_cast<size_t>(query_head) * Config::value_size() + value_idx] =
-        merged_l == 0.0f ? 0.0f : merged_out / merged_l;
+    const size_t out_base = static_cast<size_t>(query_head) * Config::value_size() + pair_idx * 2;
+    if (merged_l == 0.0f) {
+        weighted_values[out_base] = 0.0f;
+        weighted_values[out_base + 1] = 0.0f;
+    } else {
+        weighted_values[out_base] = merged_out.x / merged_l;
+        weighted_values[out_base + 1] = merged_out.y / merged_l;
+    }
 }
 
 } // namespace
@@ -181,18 +226,18 @@ public:
     std::shared_ptr<CudaBuffer> partial_stats_buffer;
     std::shared_ptr<CudaBuffer> partial_values_buffer;
     int32_t max_seq_len;
-    int32_t max_tile_count;
+    int32_t max_partial_count;
 
     /**
      * Allocate temporary space
      */
     explicit GroupQueryAttention(int32_t max_seq_len): max_seq_len(max_seq_len),
-                                                       max_tile_count(gqa_tile_count_for_seq_len(max_seq_len)) {
+                                                       max_partial_count(gqa_partial_count_for_seq_len(max_seq_len)) {
         partial_stats_buffer = std::make_shared<CudaBuffer>(
-            static_cast<size_t>(Qwen2Config::num_query_heads()) * max_tile_count * 2 * sizeof(float));
+            static_cast<size_t>(Qwen2Config::num_query_heads()) * max_partial_count * 2 * sizeof(float));
         partial_values_buffer = std::make_shared<CudaBuffer>(
-            static_cast<size_t>(Qwen2Config::num_query_heads()) * max_tile_count *
-            Qwen2Config::value_size() * sizeof(float));
+            static_cast<size_t>(Qwen2Config::num_query_heads()) * max_partial_count *
+            (Qwen2Config::value_size() / 2) * sizeof(float2));
     }
 
     /**
@@ -224,8 +269,8 @@ public:
         const int32_t tile_count = gqa_tile_count_for_seq_len(seq_len);
         auto *partial_maxima = static_cast<float *>(partial_stats_buffer->data);
         auto *partial_denominators =
-            partial_maxima + static_cast<size_t>(Qwen2Config::num_query_heads()) * max_tile_count;
-        auto *partial_weighted_values = static_cast<float *>(partial_values_buffer->data);
+            partial_maxima + static_cast<size_t>(Qwen2Config::num_query_heads()) * max_partial_count;
+        auto *partial_weighted_values = static_cast<float2 *>(partial_values_buffer->data);
 
         const dim3 tile_grid(Qwen2Config::num_query_heads(), tile_count);
         gqa_fused_tile_kernel<QWEN2_SIZE><<<tile_grid, kGqaTileThreads, 0, stream>>>(
@@ -237,7 +282,7 @@ public:
             partial_weighted_values,
             layer_num,
             seq_len,
-            max_tile_count);
+            max_partial_count);
         checkCuda(cudaGetLastError());
 
         gqa_merge_tile_partials_kernel<QWEN2_SIZE><<<Qwen2Config::num_query_heads(), kGqaMergeThreads, 0, stream>>>(
@@ -246,7 +291,7 @@ public:
             partial_weighted_values,
             weighted_values,
             seq_len,
-            max_tile_count);
+            max_partial_count);
         checkCuda(cudaGetLastError());
     }
 };
